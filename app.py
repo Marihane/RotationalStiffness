@@ -20,7 +20,7 @@ with st.sidebar:
     st.header("Inputs")
     mrd = st.number_input("Mrd [kNm]", min_value=0.0, value=1590.0, step=10.0)
     i_tangent = st.number_input("I_TANGENT (index)", min_value=1, value=3, step=1)
-    title = st.text_input("Plot title", "Rotational Stiffness - Example")
+    title = st.text_input("Plot title", "Rotational Stiffness")
 
 
 def rot_at_mrd(rot, mom, target):
@@ -181,3 +181,4 @@ st.download_button(
     file_name="stiffness_lines.csv",
     mime="text/csv",
 )
+
