@@ -1,4 +1,4 @@
-# app.py — Rotational stiffness (simple, adaptive auto-window)
+# app.py — Rotational stiffness (simple, adaptive auto-window v2)
 
 import numpy as np
 import pandas as pd
@@ -7,7 +7,29 @@ import streamlit as st
 
 st.set_page_config(page_title="Rotational Stiffness", layout="wide")
 st.title("Rotational stiffness")
-st.caption("Upload an Excel file with two columns: Rotation (x), Moment (y)")
+
+st.caption("Upload an Excel file with two columns: Rotation (x) and Moment (y).")
+
+# --- Page explanation (very short & simple) ---
+with st.expander("What is happening here? (click to expand)", expanded=False):
+    st.markdown(
+        """
+**Goal:** Find the **initial rotational stiffness** \\(S_{j,ini}\\), i.e. the slope of the curve near the origin.
+
+**How we compute it (Auto):**
+- We only use the **early, almost-linear part** of the curve where the moment is small.
+- We test windows up to **p% of the peak moment** (now 2–40%).
+- For each window we fit a straight line **through the origin** and check how linear it is (R²).
+- We pick the **largest early window** that is still linear and has **enough points**.
+
+**What is p%?**  
+If the peak moment in your data is, say, 1000 kNm:
+- **p = 10%** means we only use points where **M ≤ 100 kNm** to compute the slope.
+- Larger p includes more of the curve; too large p may include curvature and bias the slope.
+
+**Manual mode:** You choose **one p%** yourself if Auto doesn’t match your judgment.
+        """
+    )
 
 # ---------- Small helpers ----------
 def ols_slope_through_origin(x, y):
@@ -23,9 +45,9 @@ def r2_linear(y_true, y_fit):
     """Standard R² (w.r.t. mean of y) to check linearity of the window."""
     y_true = np.asarray(y_true, float)
     y_fit = np.asarray(y_fit, float)
-    ss_res = np.sum((y_true - y_fit)**2)
-    ss_tot = np.sum((y_true - y_true.mean())**2)
-    return 1.0 - ss_res/ss_tot if ss_tot > 0 else 1.0
+    ss_res = np.sum((y_true - y_fit) ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
 
 def find_rotation_at_mrd(rot, mom, mrd):
     """
@@ -33,83 +55,76 @@ def find_rotation_at_mrd(rot, mom, mrd):
     Picks the last crossing if there are several. Returns None if no crossing.
     """
     s = mom - mrd
-    # exact hit
     hits = np.where(np.isclose(s, 0.0, atol=1e-12))[0]
     if hits.size:
         return float(rot[hits[-1]])
-    # sign change between successive points => crossing on that segment
-    idx = np.where(s[:-1] * s[1:] < 0)[0]
+    idx = np.where(s[:-1] * s[1:] < 0)[0]  # sign change => crossing
     if idx.size == 0:
         return None
     i = int(idx[-1])
     x0, x1 = rot[i], rot[i + 1]
     y0, y1 = mom[i], mom[i + 1]
-    # linear interpolation on the segment
     return float(x0 + (mrd - y0) * (x1 - x0) / (y1 - y0))
 
-def window_slope_by_percent(rot, mom, p):
+def window_slope_by_percent(rot, mom, p, theta_min=1e-9):
     """
-    Use only points with M <= p% of peak M, skip exact zero rotation,
+    Use only points with M <= p% of peak M and rotation > theta_min,
     fit slope through origin, and return (k, r2, mask).
     """
     Mmax = float(np.max(mom))
     lim = (p / 100.0) * Mmax
-    mask = (mom <= lim) & (rot > 0.0)
+    mask = (mom <= lim) & (rot > theta_min)
     xx, yy = rot[mask], mom[mask]
     if xx.size < 2:
         return None, None, mask
     k = ols_slope_through_origin(xx, yy)
-    yfit = k * xx
-    r2 = r2_linear(yy, yfit)
+    if k is None:
+        return None, None, mask
+    r2 = r2_linear(yy, k * xx)
     return k, r2, mask
 
 def choose_auto_window(rot, mom,
-                       p_min=2, p_max=25,
+                       p_min=2, p_max=40,
                        r2_strict=0.995, r2_loose=0.99):
     """
     Adaptive auto window:
-      - Try p in [p_min, p_max] (% of peak M).
-      - Adaptive min points ≈ 15% of N, clamped to [6,12].
-      - Prefer the LARGEST p with R² >= r2_strict and enough points.
-      - If none, accept R² >= r2_loose.
+      - Try p in [2, 40] (% of peak M).
+      - Adaptive min points ≈ 10% of N, clamped to [4, 10].
+      - Prefer the LARGEST p with R² >= 0.995 and enough points.
+      - Else accept R² >= 0.99.
       - Fallback = highest R² with at least 3 points.
-    Returns {p, k, r2, mask} or None.
+    Returns {p, k, r2, mask, reason} or None.
     """
     N = len(rot)
-    min_pts = int(max(6, min(12, round(0.15 * N))))
+    min_pts = int(max(4, min(10, round(0.10 * N))))
 
     strict_ok = None
     loose_ok = None
     fallback = None
 
     for p in range(int(p_min), int(p_max) + 1):
-        k, r2, mask = window_slope_by_percent(rot, mom, p)
+        k, r2, mask = window_slope_by_percent(rot, mom, p, theta_min=1e-9)
         if k is None:
             continue
         n = int(mask.sum())
 
-        # Best overall R² (fallback), require ≥3 points
+        # Track best overall R² (fallback), require ≥3 points
         if n >= 3 and (fallback is None or r2 > fallback["r2"]):
-            fallback = {"p": p, "k": k, "r2": r2, "mask": mask}
+            fallback = {"p": p, "k": k, "r2": r2, "mask": mask, "reason": "auto (best R² fallback)"}
 
-        # Keep largest p that meets strict criteria
+        # Largest p that meets strict criteria
         if n >= min_pts and r2 >= r2_strict:
-            strict_ok = {"p": p, "k": k, "r2": r2, "mask": mask}
+            strict_ok = {"p": p, "k": k, "r2": r2, "mask": mask, "reason": "auto (strict)"}
 
-        # Keep largest p that meets loose criteria
+        # Largest p that meets looser criteria
         if n >= min_pts and r2 >= r2_loose:
-            loose_ok = {"p": p, "k": k, "r2": r2, "mask": mask}
+            loose_ok = {"p": p, "k": k, "r2": r2, "mask": mask, "reason": "auto (loose)"}
 
     if strict_ok is not None:
-        strict_ok["reason"] = "auto (strict)"
         return strict_ok
     if loose_ok is not None:
-        loose_ok["reason"] = "auto (loose)"
         return loose_ok
-    if fallback is not None:
-        fallback["reason"] = "auto (fallback)"
-        return fallback
-    return None
+    return fallback
 
 # ---------- Sidebar (minimal controls) ----------
 with st.sidebar:
@@ -117,7 +132,7 @@ with st.sidebar:
     title = st.text_input("Plot title", "Rotational Stiffness")
     mode = st.radio("Initial stiffness window", ["Auto (recommended)", "Manual p%"], index=0)
     if mode == "Manual p%":
-        p_manual = st.slider("p% of peak M", 5, 25, 10, 1)
+        p_manual = st.slider("p% of peak M", 5, 40, 10, 1)
 
 # ---------- File upload ----------
 uploaded = st.file_uploader(
@@ -144,7 +159,7 @@ x = x[order]; y = y[order]
 
 # ---------- Compute Sj,ini ----------
 if mode == "Auto (recommended)":
-    choice = choose_auto_window(x, y)  # adaptive defaults
+    choice = choose_auto_window(x, y)  # adaptive defaults (2–40%, min pts 4–10)
     if choice is None:
         st.error("Could not determine a stable initial window. Check your data.")
         st.stop()
@@ -153,7 +168,7 @@ if mode == "Auto (recommended)":
     used_mask = choice["mask"]
     note = f"{choice['reason']}, p≤{choice['p']}%"
 else:
-    k, r2, mask_p = window_slope_by_percent(x, y, p_manual)
+    k, r2, mask_p = window_slope_by_percent(x, y, p_manual, theta_min=1e-9)
     if k is None:
         st.error("Not enough points in the selected window. Increase p%.")
         st.stop()
@@ -170,7 +185,7 @@ x_max = float(np.max(x)) if x.size else 0.0
 x_end_ini = (mrd / Sj_ini) if Sj_ini != 0 else x_max
 x_end_sj  = (mrd / Sj)     if Sj     != 0 else x_max
 
-# Clip stiffness lines so they don't overshoot the curve range or Mrd
+# Clip lines to earliest of Mrd or data end
 limits = [v for v in [x_end_ini, x_end_sj, (x_mrd if x_mrd is not None else x_max), x_max] if np.isfinite(v)]
 x_limit = float(np.min(limits)) if limits else x_max
 
@@ -182,7 +197,7 @@ y_line_sj  = Sj * x_line
 fig, ax = plt.subplots(figsize=(11, 6))
 ax.plot(x, y, label="Moment–Rotation", color="black", linewidth=1.8)
 
-# Highlight points used for Sj,ini
+# Points used for Sj,ini
 if used_mask is not None and used_mask.any():
     ax.scatter(x[used_mask], y[used_mask], s=28, edgecolor="blue", facecolor="none",
                linewidth=1.2, label="Points used for Sj,ini")
