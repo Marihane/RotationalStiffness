@@ -238,4 +238,17 @@ else:
             transform=ax.transAxes, color="red", va="top", fontsize=9)
 
 ax.set_xlabel("Rotation [rad]")
-ax.set_ylabel("Moment_
+ax.set_ylabel("Moment [kNm]")
+ax.set_title(title)
+ax.grid(True, linewidth=0.4, alpha=0.5)
+ax.legend()
+fig.tight_layout()
+st.pyplot(fig, clear_figure=False)
+
+# ---------- Results ----------
+st.subheader("Results")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Sj,ini [kNm/rad]", f"{Sj_ini:.1f}")
+c2.metric("Sj [kNm/rad]", f"{Sj:.1f}")
+c3.metric("R² (window)", f"{used_r2:.5f}" if used_r2 is not None else "n/a")
+c4.metric("Rotation at Mrd [rad]", f"{x_mrd:.6f}" if x_mrd is not None else "no intersection")
