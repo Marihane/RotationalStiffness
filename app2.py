@@ -1,4 +1,4 @@
-# app.py — Rotational stiffness (Auto = steepest initial prefix)
+# app.py — Rotational stiffness (Auto = steepest initial prefix; Manual p% with robust fallback)
 
 import numpy as np
 import pandas as pd
@@ -9,19 +9,18 @@ st.set_page_config(page_title="Rotational Stiffness", layout="wide")
 st.title("Rotational stiffness")
 st.caption("Upload an Excel file with two columns: Rotation (x) and Moment (y).")
 
-# --- What the app does (short) ---
-with st.expander("What is happening?", expanded=False):
+# --- Short explanation (simple) ---
+with st.expander("What is happening? (tap to expand)", expanded=False):
     st.markdown(
         """
 **Goal:** Estimate the **initial rotational stiffness** \\(S_{j,ini}\\) — the slope near the origin.
 
 **Auto (recommended):**  
-We only look at the **first points by rotation**. For each prefix (first 2 points, first 3, …) we fit a straight line **through the origin** and compute its slope and linearity (R²).  
-We pick the prefix where the slope is **maximally steep** and still **linear**; then we **stop before the curve bends** (when the slope drops).  
-This locks onto the **straight, steep start** of the curve.
+We only look at the **first points by rotation** (closest to zero). For each prefix (first 2 points, first 3, …) we fit a straight line **through the origin** and compute its slope and linearity (R²).  
+We pick the prefix where the slope is **maximally steep** and still **linear**, stopping before the curve bends. This locks onto the **straight, steep start** of the curve.
 
 **Manual p% (optional):**  
-If you prefer, you can use points with \(M \le p\\% \cdot M_{max}\) instead. (E.g., p = 2% uses points with \(M \le 0.02\,M_{max}\).)
+Use points with \(M \le p\\% \cdot M_{max}\). If there are too few points, the app automatically **expands p** until a valid window is found; if needed, it falls back to the **first K** smallest-rotation points.
         """
     )
 
@@ -30,7 +29,8 @@ def ols_slope_through_origin(x, y):
     """Slope k minimizing sum (y - kx)^2 with intercept fixed at 0."""
     xx = np.asarray(x, float); yy = np.asarray(y, float)
     denom = float(np.dot(xx, xx))
-    if denom == 0: return None
+    if denom == 0:
+        return None
     return float(np.dot(xx, yy) / denom)
 
 def r2_linear(y_true, y_fit):
@@ -44,9 +44,11 @@ def find_rotation_at_mrd(rot, mom, mrd):
     """Piecewise-linear crossing (last crossing if multiple)."""
     s = mom - mrd
     hits = np.where(np.isclose(s, 0.0, atol=1e-12))[0]
-    if hits.size: return float(rot[hits[-1]])
+    if hits.size:
+        return float(rot[hits[-1]])
     idx = np.where(s[:-1] * s[1:] < 0)[0]
-    if idx.size == 0: return None
+    if idx.size == 0:
+        return None
     i = int(idx[-1]); x0, x1 = rot[i], rot[i+1]; y0, y1 = mom[i], mom[i+1]
     return float(x0 + (mrd - y0) * (x1 - x0) / (y1 - y0))
 
@@ -56,86 +58,106 @@ def window_by_percent(rot, mom, p, theta_min=1e-9):
     lim = (p / 100.0) * Mmax
     mask = (mom <= lim) & (rot > theta_min)
     xx, yy = rot[mask], mom[mask]
-    if xx.size < 2: return None, None, mask
+    if xx.size < 2:
+        return None, None, mask
     k = ols_slope_through_origin(xx, yy)
-    if k is None or not np.isfinite(k): return None, None, mask
+    if k is None or not np.isfinite(k):
+        return None, None, mask
     r2 = r2_linear(yy, k * xx)
     return k, r2, mask
 
-# ---------- New AUTO: steepest initial prefix ----------
+def manual_window_or_expand(rot, mom, p_start, theta_min=1e-9):
+    """
+    Manual p% that always tries to succeed:
+      1) Try requested p%. If <2 points, expand p by 1% steps up to 100%.
+      2) If still too few points, fall back to first K=3..10 smallest-rotation points.
+    Returns (k, r2, mask, note) or (None, None, None, note).
+    """
+    # 1) Expand p% upwards until a valid window exists
+    for p_try in list(np.arange(float(p_start), 100.0 + 1e-9, 1.0)):
+        k, r2, mask = window_by_percent(rot, mom, p_try, theta_min=theta_min)
+        if k is not None:
+            note = f"manual, p≤{p_try:g}%"
+            if p_try > p_start:
+                note += f" (expanded from {p_start:g}%)"
+            return k, r2, mask, note
+
+    # 2) Fallback: first K points by smallest rotation
+    pos = rot > theta_min
+    for K in range(3, 11):  # 3..10
+        xx = rot[pos][:K]; yy = mom[pos][:K]
+        if xx.size >= 2:
+            k = ols_slope_through_origin(xx, yy)
+            if k is not None and np.isfinite(k):
+                r2 = r2_linear(yy, k * xx)
+                mask = np.zeros_like(rot, dtype=bool)
+                mask[np.where(pos)[0][:xx.size]] = True
+                return k, r2, mask, f"manual fallback, first K={xx.size}"
+
+    return None, None, None, "manual: could not form a valid window"
+
+# ---------- AUTO: steepest initial prefix ----------
 def choose_initial_prefix(rot, mom,
-                          k_cap=30,        # analyze up to the first 30 points (or all if fewer)
-                          r2_min=0.995,   # required linearity for acceptance
-                          drop_tol=0.05,  # stop before slope drops >5% from its running max
+                          k_cap=30,       # analyze up to the first 30 points (or all if fewer)
+                          r2_min=0.995,   # required linearity
+                          drop_tol=0.05,  # stop if slope drops >5% from running max
                           theta_min=1e-9):
     """
-    Iterate k = 2..Kcap (prefix length). For each prefix:
-      - fit slope through origin on first k positive-rotation points,
+    Iterate k = 2..Kcap (prefix length). For each prefix (first k positive-rotation points):
+      - fit slope through origin,
       - compute R²,
       - track running max slope (steepest prefix).
     Return the prefix just BEFORE the first significant slope drop (> drop_tol),
     provided its R² >= r2_min and k >= min_pts. If no drop found, return the
-    steepest prefix that meets R².
+    steepest prefix that meets R²; else running max as last resort.
     """
-    # Keep only positive-rotation points (skip numeric zeros/backlash)
     pos = rot > theta_min
     X = rot[pos]; Y = mom[pos]
-    if X.size < 2: return None  # not enough data
+    if X.size < 2:
+        return None
 
     Kcap = int(min(k_cap, X.size))
     min_pts = int(max(4, min(10, round(0.10 * X.size))))  # ~10% of available, clamp [4,10]
 
-    best = None               # best (max slope) seen so far with R² OK
-    best_k = None
-    best_r2 = None
-    best_mask = None
-    running_max = -np.inf
-    running_k = None
-    running_r2 = None
-    running_mask = None
+    best = None; best_k = None; best_r2 = None; best_mask = None
+    running_max = -np.inf; running_k = None; running_r2 = None; running_mask = None
+
+    pos_idx = np.where(pos)[0]
 
     for k in range(2, Kcap + 1):
         xx = X[:k]; yy = Y[:k]
         k_slope = ols_slope_through_origin(xx, yy)
-        if k_slope is None or not np.isfinite(k_slope): continue
+        if k_slope is None or not np.isfinite(k_slope):
+            continue
         r2 = r2_linear(yy, k_slope * xx)
 
-        # track best that passes R² and min_pts
         if r2 >= r2_min and k >= min_pts and k_slope > running_max:
             best = k_slope; best_k = k; best_r2 = r2
             mask = np.zeros_like(rot, dtype=bool)
-            mask[np.where(pos)[0][:k]] = True
+            mask[pos_idx[:k]] = True
             best_mask = mask
 
-        # update running maximum (for drop detection)
         if k_slope > running_max:
-            running_max = k_slope
-            running_k = k
-            running_r2 = r2
+            running_max = k_slope; running_k = k; running_r2 = r2
             mask = np.zeros_like(rot, dtype=bool)
-            mask[np.where(pos)[0][:k]] = True
+            mask[pos_idx[:k]] = True
             running_mask = mask
         else:
-            # check for first significant drop from the max
+            # first significant drop from the max? choose the max just before the bend
             if running_max > 0 and (running_max - k_slope) / running_max >= drop_tol:
-                # choose the steepest prefix (running_k) if it also passes R² & min_pts
                 if running_r2 is not None and running_k is not None and running_r2 >= r2_min and running_k >= min_pts:
-                    return {"k": running_k, "slope": running_max, "r2": running_r2, "mask": running_mask,
-                            "reason": f"auto prefix: steepest before bend (k={running_k})"}
-                # otherwise fall back to best seen that met R²
+                    return {"k": running_k, "slope": running_max, "r2": running_r2,
+                            "mask": running_mask, "reason": f"auto prefix: steepest before bend (k={running_k})"}
                 if best is not None:
-                    return {"k": best_k, "slope": best, "r2": best_r2, "mask": best_mask,
-                            "reason": f"auto prefix: best R² & steep (k={best_k})"}
-                # if nothing passes R² yet, keep scanning
-                # (break omitted to allow further improvement)
+                    return {"k": best_k, "slope": best, "r2": best_r2,
+                            "mask": best_mask, "reason": f"auto prefix: best R² & steep (k={best_k})"}
 
-    # End of loop: no clear drop found — take best that met R², else take running max
     if best is not None:
-        return {"k": best_k, "slope": best, "r2": best_r2, "mask": best_mask,
-                "reason": f"auto prefix: best R² & steep (k={best_k})"}
+        return {"k": best_k, "slope": best, "r2": best_r2,
+                "mask": best_mask, "reason": f"auto prefix: best R² & steep (k={best_k})"}
     if running_k is not None:
-        return {"k": running_k, "slope": running_max, "r2": running_r2, "mask": running_mask,
-                "reason": f"auto prefix: running max (k={running_k})"}
+        return {"k": running_k, "slope": running_max, "r2": running_r2,
+                "mask": running_mask, "reason": f"auto prefix: running max (k={running_k})"}
     return None
 
 # ---------- Sidebar (minimal controls) ----------
@@ -161,7 +183,6 @@ if not uploaded:
 df = pd.read_excel(uploaded)
 x = df.iloc[:, 0].to_numpy(float)
 y = df.iloc[:, 1].to_numpy(float)
-
 mask = np.isfinite(x) & np.isfinite(y)
 x = x[mask]; y = y[mask]
 order = np.argsort(x)
@@ -175,19 +196,13 @@ if mode == "Auto (recommended)":
     if choice is None:
         st.error("Could not lock onto an initial straight segment. Try Manual p% (e.g., 1–3%).")
         st.stop()
-    Sj_ini = choice["slope"]
-    used_r2 = choice["r2"]
-    used_mask = choice["mask"]
-    note = choice["reason"]
+    Sj_ini = choice["slope"]; used_r2 = choice["r2"]; used_mask = choice["mask"]; note = choice["reason"]
 else:
-    k, r2, mask_p = window_by_percent(x, y, p_manual, theta_min=theta_min)
+    k, r2, mask_p, note = manual_window_or_expand(x, y, p_start=p_manual, theta_min=theta_min)
     if k is None:
-        st.error("Not enough points in the selected window. Increase p% slightly.")
+        st.error("Manual mode: could not form a valid window. Try a larger p% or check your data.")
         st.stop()
-    Sj_ini = k
-    used_r2 = r2
-    used_mask = mask_p
-    note = f"manual, p≤{p_manual:g}%"
+    Sj_ini = k; used_r2 = r2; used_mask = mask_p
 
 Sj = Sj_ini / 2.0
 
@@ -211,10 +226,10 @@ if used_mask is not None and used_mask.any():
     ax.scatter(x[used_mask], y[used_mask], s=28, edgecolor="blue", facecolor="none",
                linewidth=1.2, label="Points used for Sj,ini")
 
+legend_note = note if mode == "Manual p%" else note
 ax.plot(x_line, y_line_ini, "--", color="blue",
-        label=f"Sj,ini ≈ {Sj_ini:.1f} kNm/rad ({note})")
-ax.plot(x_line, y_line_sj,  "--", color="green",
-        label=f"Sj ≈ {Sj:.1f} kNm/rad")
+        label=f"Sj,ini ≈ {Sj_ini:.1f} kNm/rad ({legend_note})")
+ax.plot(x_line, y_line_sj,  "--", color="green", label=f"Sj ≈ {Sj:.1f} kNm/rad")
 ax.axhline(mrd, linestyle=":", color="red", label=f"Mrd = {mrd:.1f} kNm")
 if x_mrd is not None:
     ax.plot(x_mrd, mrd, "ro", label="Mrd point")
@@ -223,17 +238,4 @@ else:
             transform=ax.transAxes, color="red", va="top", fontsize=9)
 
 ax.set_xlabel("Rotation [rad]")
-ax.set_ylabel("Moment [kNm]")
-ax.set_title(title)
-ax.grid(True, linewidth=0.4, alpha=0.5)
-ax.legend()
-fig.tight_layout()
-st.pyplot(fig, clear_figure=False)
-
-# ---------- Results ----------
-st.subheader("Results")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Sj,ini [kNm/rad]", f"{Sj_ini:.1f}")
-c2.metric("Sj [kNm/rad]", f"{Sj:.1f}")
-c3.metric("R² (window)", f"{used_r2:.5f}" if used_r2 is not None else "n/a")
-c4.metric("Rotation at Mrd [rad]", f"{x_mrd:.6f}" if x_mrd is not None else "no intersection")
+ax.set_ylabel("Moment_
