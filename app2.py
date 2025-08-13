@@ -108,6 +108,36 @@ def manual_origin_to_point(rot, mom, j_index, theta_min=1e-9):
     mask[j] = True
     # R² doesn't really apply to 1-point secant; report n/a as 1.0
     return k, 1.0, mask, f"origin→point j={j_index}"
+def window_by_moment_range(rot, mom, M_low, M_high,
+                           theta_min=1e-9, stop_at_first_peak=True):
+    """
+    Use points with M_low <= M <= M_high and rotation > theta_min.
+    If stop_at_first_peak=True, discard anything after the first local maximum
+    (captures the 'before the dip' part).
+    Returns (k, r2, mask) or (None, None, mask) if too few points.
+    """
+    rot = np.asarray(rot, float)
+    mom = np.asarray(mom, float)
+
+    # optional: stop at first local maximum (first index where mom starts decreasing)
+    if stop_at_first_peak and mom.size >= 3:
+        dec = np.where(mom[1:] < mom[:-1])[0]
+        if dec.size:
+            i_peak = int(dec[0])      # last increasing index
+            rot = rot[:i_peak+1]
+            mom = mom[:i_peak+1]
+
+    mask = (mom >= M_low) & (mom <= M_high) & (rot > theta_min)
+    xx, yy = rot[mask], mom[mask]
+    if xx.size < 2:
+        return None, None, mask
+
+    k = ols_slope_through_origin(xx, yy)
+    if k is None or not np.isfinite(k):
+        return None, None, mask
+    r2 = r2_linear(yy, k * xx)
+    return k, r2, mask
+
 
 # --- AUTO: steepest initial prefix ---
 def choose_initial_prefix(rot, mom,
@@ -180,6 +210,29 @@ with st.sidebar:
         if use_origin_point:
             j_manual = st.slider("Choose point j (1 = first positive-rotation point)", 1, 30, 2, 1)
 
+mode = st.radio(
+    "Initial stiffness window",
+    ["Auto (recommended)", "Manual (% of Mrd)", "Manual (first K points)", "Manual (moment window)"],
+    index=0
+)
+
+if mode == "Manual (% of Mrd)":
+    q_mrd = st.slider("q% of Mrd (window cap)", 0.5, 50.0, 5.0, 0.5)
+
+elif mode == "Manual (first K points)":
+    K_manual = st.slider("K (first points to use)", 2, 30, 2, 1)
+    use_origin_point = st.checkbox("Use origin → point j instead", value=False)
+    if use_origin_point:
+        j_manual = st.slider("Choose point j (1 = first positive-rotation point)", 1, 30, 2, 1)
+
+elif mode == "Manual (moment window)":
+    colA, colB = st.columns(2)
+    with colA:
+        M_low = st.number_input("M_low [kNm]", min_value=0.0, value=50.0, step=1.0)
+    with colB:
+        M_high = st.number_input("M_high [kNm]", min_value=0.0, value=200.0, step=1.0)
+    stop_at_peak = st.checkbox("Stop at first local peak (before the dip)", value=True)
+
 # ---------- File upload ----------
 uploaded = st.file_uploader(
     "Choose an Excel file (.xlsx)",
@@ -229,6 +282,16 @@ else:  # Manual (first K points)
 
 Sj = Sj_ini / 2.0
 
+elif mode == "Manual (moment window)":
+    k, r2, mask_m = window_by_moment_range(x, y, M_low, M_high, theta_min=theta_min, stop_at_first_peak=stop_at_peak)
+    if k is None:
+        st.error("Too few points in the chosen moment window. Expand M_high or lower M_low.")
+        st.stop()
+    Sj_ini = k
+    used_r2 = r2
+    used_mask = mask_m
+    note = f"manual, {M_low:g}–{M_high:g} kNm" + (" (stopped at first peak)" if stop_at_peak else "")
+
 # ---------- Mrd & stiffness lines ----------
 x_mrd = find_rotation_at_mrd(x, y, mrd)
 x_max = float(np.max(x)) if x.size else 0.0
@@ -274,3 +337,4 @@ c1.metric("Sj,ini [kNm/rad]", f"{Sj_ini:.1f}")
 c2.metric("Sj [kNm/rad]", f"{Sj:.1f}")
 c3.metric("R² (window)", f"{used_r2:.5f}" if used_r2 is not None else "n/a")
 c4.metric("Rotation at Mrd [rad]", f"{x_mrd:.6f}" if x_mrd is not None else "no intersection")
+
