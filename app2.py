@@ -1,6 +1,4 @@
-# app.py — Rotational stiffness (Auto + Manual sliding window)
-# Auto = steepest initial prefix
-# Manual = consecutive K-point window with a movable start index
+# app.py — Rotational stiffness (Auto + Manual sliding window that can start at 0)
 
 import numpy as np
 import pandas as pd
@@ -20,8 +18,8 @@ with st.expander("What the app does (short)", expanded=False):
 - **Auto (recommended):** looks at the first few points (smallest rotations), fits lines through the origin,
   and picks the **steepest straight prefix** before the curve begins to bend.
 - **Manual (sliding window):** choose a **window size K** (number of consecutive points) and **move it**
-  along the early part of the curve with a **Start at point j** slider. The slope is an OLS line **through the origin**
-  using only those K points.
+  along the curve (including the **very first point at rotation = 0**). The slope is an OLS line **through the origin**
+  using only those K points. The app quietly adjusts if your chosen window would be invalid.
         """
     )
 
@@ -61,7 +59,7 @@ def choose_initial_prefix(rot, mom, k_cap=30, r2_min=0.995, drop_tol=0.05, theta
     pos = rot > theta_min
     X = rot[pos]; Y = mom[pos]
     if X.size < 2:
-        return None  # not enough early data
+        return None
 
     Kcap = int(min(k_cap, X.size))
     min_pts = int(max(4, min(10, round(0.10 * X.size))))  # ~10% of available, clamp [4,10]
@@ -103,39 +101,64 @@ def choose_initial_prefix(rot, mom, k_cap=30, r2_min=0.995, drop_tol=0.05, theta
                 "reason": f"auto prefix: running max (k={running_k})"}
     return None
 
-def select_window_by_offset(rot, mom, start_j, K, theta_min=1e-9):
+def sliding_window_including_zero(rot, mom, start_j, K):
     """
-    Manual sliding window: take K consecutive **positive-rotation** points,
-    starting at the j-th positive-rotation point (1-based).
-    Always returns a valid window (auto-clamps j and K).
+    Manual sliding window over points **sorted by rotation** (includes rotation=0).
+    Takes K consecutive points starting at 1-based index start_j.
+    Always returns a valid window by clamping/adjusting j and K.
     """
-    pos_idx = np.where(rot > theta_min)[0]
-    npos = int(pos_idx.size)
-    if npos < 2:
-        return None, None, None, "manual window: not enough early points"
+    n = rot.size
+    if n < 2:
+        return None, None, None, "not enough data"
 
-    # Clamp K and start_j to valid ranges
-    K = int(max(2, min(K, npos)))
-    max_start = max(1, npos - K + 1)
+    # Indices in ascending rotation (includes zeros)
+    order = np.argsort(rot)
+    n_sorted = int(order.size)
+
+    # Clamp K and start position
+    K = int(max(2, min(K, n_sorted)))
+    max_start = max(1, n_sorted - K + 1)
     start_j = int(max(1, min(start_j, max_start)))
 
-    sel = pos_idx[start_j - 1 : start_j - 1 + K]
+    sel = order[start_j - 1 : start_j - 1 + K]
     xx, yy = rot[sel], mom[sel]
 
+    # If all selected rotations are zero, push the end forward until we include a positive x
+    if np.allclose(xx, 0.0):
+        # try to extend forward in the sorted list
+        end = start_j - 1 + K
+        while end < n_sorted and np.allclose(rot[order[start_j - 1 : end + 1]], 0.0):
+            end += 1
+        sel = order[start_j - 1 : min(end + 1, n_sorted)]
+        xx, yy = rot[sel], mom[sel]
+
+    # If still degenerate, shift right until denom > 0 (or give up gracefully)
     k_slope = ols_slope_through_origin(xx, yy)
-    if k_slope is None or not np.isfinite(k_slope):
-        # very unlikely with clamped ranges; fallback to first 2
-        sel = pos_idx[:2]; xx, yy = rot[sel], mom[sel]
+    shift = 0
+    while (k_slope is None or not np.isfinite(k_slope)) and (start_j - 1 + K + shift < n_sorted):
+        shift += 1
+        sel = order[start_j - 1 + shift : start_j - 1 + shift + K]
+        xx, yy = rot[sel], mom[sel]
         k_slope = ols_slope_through_origin(xx, yy)
-        note = f"manual window auto-fallback (first 2 points)"
+
+    if k_slope is None or not np.isfinite(k_slope):
+        # Final fallback: first two non-identical-rotation points
+        uniq = np.flatnonzero(np.diff(rot[order], prepend=np.nan))
+        if uniq.size >= 2:
+            sel = order[uniq[:2]]
+            xx, yy = rot[sel], mom[sel]
+            k_slope = ols_slope_through_origin(xx, yy)
+            note = "manual window auto-fallback (first two distinct rotations)"
+        else:
+            return None, None, None, "manual window: could not form a valid window"
     else:
-        note = f"manual window: K={K}, start j={start_j}"
+        note = f"manual window: K={len(sel)}, start j={start_j + shift}"
 
     r2 = r2_linear(yy, k_slope * xx)
     mask = np.zeros_like(rot, dtype=bool); mask[sel] = True
-    return k_slope, r2, mask, note, npos, K, start_j
+    return k_slope, r2, mask, note
 
-# ── Sidebar: only stable controls up-front ────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     mrd = st.number_input("Mrd [kNm]", min_value=0.0, value=340.0, step=10.0)
     title = st.text_input("Plot title", "Rotational Stiffness")
@@ -160,48 +183,40 @@ mask = np.isfinite(x) & np.isfinite(y)
 x = x[mask]; y = y[mask]
 order = np.argsort(x)
 x = x[order]; y = y[order]
-theta_min = 1e-9
 
-# ── If Manual mode, show the dynamic sliders now that we know data size ───────
+# ── If Manual mode, show sliders now that we know data size (includes zeros) ──
 if mode == "Manual (sliding window)":
-    pos_idx = np.where(x > theta_min)[0]
-    npos = int(pos_idx.size)
-    if npos < 2:
-        st.error("Not enough early (positive rotation) points for a manual window.")
+    n_total = int(x.size)
+    if n_total < 2:
+        st.error("Not enough points for a manual window.")
         st.stop()
-    max_K = int(min(30, npos))
-    # Defaults: K=2, start at 1
+    max_K = int(min(30, n_total))
     with st.sidebar:
         K_manual = st.slider("K (consecutive points)", 2, max_K, 2, 1)
-        max_start = max(1, npos - K_manual + 1)
-        start_j = st.slider("Start at point j (among early points)", 1, max_start, 1, 1)
+        max_start = max(1, n_total - K_manual + 1)
+        start_j = st.slider("Start at point j (1 = very first point)", 1, max_start, 1, 1)
 else:
     K_manual = None
     start_j = None
 
 # ── Compute Sj,ini ────────────────────────────────────────────────────────────
 if mode == "Auto (recommended)":
-    choice = choose_initial_prefix(x, y, k_cap=30, r2_min=0.995, drop_tol=0.05, theta_min=theta_min)
+    choice = choose_initial_prefix(x, y, k_cap=30, r2_min=0.995, drop_tol=0.05, theta_min=1e-9)
     if choice is None:
-        # last-resort: first 2 positive-rotation points
-        k_slope, used_r2, used_mask, note, *_ = select_window_by_offset(x, y, start_j=1, K=2, theta_min=theta_min)
+        # last-resort: first 2 distinct-rotation points (from very start)
+        k_slope, used_r2, used_mask, note = sliding_window_including_zero(x, y, start_j=1, K=2)
         if k_slope is None:
             st.error("Not enough data to estimate Sj,ini.")
             st.stop()
         Sj_ini = k_slope; note = "auto fallback → first 2 points"
     else:
         Sj_ini = choice["slope"]; used_r2 = choice["r2"]; used_mask = choice["mask"]; note = choice["reason"]
-
-else:  # Manual sliding window
-    k_slope, used_r2, used_mask, note, npos, K_final, j_final = select_window_by_offset(
-        x, y, start_j=start_j, K=K_manual, theta_min=theta_min
-    )
+else:
+    k_slope, used_r2, used_mask, note = sliding_window_including_zero(x, y, start_j=start_j, K=K_manual)
     if k_slope is None:
         st.error("Manual window: could not form a valid window.")
         st.stop()
     Sj_ini = k_slope
-    # reflect any auto clamping in the note
-    note = f"{note} (npos={npos})"
 
 Sj = Sj_ini / 2.0
 
