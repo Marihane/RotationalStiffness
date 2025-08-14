@@ -1,6 +1,5 @@
-# app.py — Rotational stiffness
-# Auto = steepest initial prefix
-# Manual = % of Mrd  OR first K points (optionally origin→point j)
+# app.py — Rotational stiffness toolbox
+# Auto = steepest initial prefix; Manual = % of Mrd / first K / moment window
 
 import numpy as np
 import pandas as pd
@@ -11,7 +10,9 @@ st.set_page_config(page_title="Rotational Stiffness", layout="wide")
 st.title("Rotational stiffness")
 st.caption("Upload an Excel file with two columns: Rotation (x) and Moment (y).")
 
-# --- Short explanation (simple) ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Info box
+# ──────────────────────────────────────────────────────────────────────────────
 with st.expander("What is happening? (tap to expand)", expanded=False):
     st.markdown(
         r"""
@@ -21,14 +22,16 @@ with st.expander("What is happening? (tap to expand)", expanded=False):
 Looks only at the **first points by rotation**. For each prefix (first 2 points, 3 points, …) it fits a line **through the origin**, checks linearity (R²), and picks the **steepest straight** prefix before the curve bends.
 
 **Manual options:**
-- **% of Mrd:** use points with \(M \le q\% \cdot M_{rd}\).  
-  This starts *lower* on the curve (early small moments) and is great when you want the first steep bit.
+- **% of Mrd:** use points with \(M \le q\% \cdot M_{rd}\). Starts lower on the curve; good for the very first steep bit.
 - **First K points:** use exactly the first **K** positive‑rotation points (as low as **K=2**).  
-  (Optional) **Origin → point j**: draw the line through the origin and a chosen early point.
-"""
+  (Optional) **Origin → point j**: line through origin and a chosen early point.
+- **Moment window:** choose \([M_{\text{low}},\,M_{\text{high}}]\). Optionally stop at the **first local peak** (“before the dip”).
+        """
     )
 
-# ---------- Small helpers ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def ols_slope_through_origin(x, y):
     """Slope k minimizing sum (y - kx)^2 with intercept fixed at 0."""
     xx = np.asarray(x, float); yy = np.asarray(y, float)
@@ -56,12 +59,9 @@ def find_rotation_at_mrd(rot, mom, mrd):
     i = int(idx[-1]); x0, x1 = rot[i], rot[i+1]; y0, y1 = mom[i], mom[i+1]
     return float(x0 + (mrd - y0) * (x1 - x0) / (y1 - y0))
 
-# --- Manual windows ---
+# Manual windows
 def window_by_percent_of_mrd(rot, mom, mrd, q_percent, theta_min=1e-9):
-    """
-    Use only points with M <= q% of Mrd (not Mmax), and rotation > theta_min.
-    Returns (k, r2, mask) or (None, None, mask) if too few points.
-    """
+    """Use points with M <= q% of Mrd & rotation > theta_min."""
     lim = (q_percent / 100.0) * float(mrd)
     mask = (mom <= lim) & (rot > theta_min)
     xx, yy = rot[mask], mom[mask]
@@ -103,27 +103,22 @@ def manual_origin_to_point(rot, mom, j_index, theta_min=1e-9):
     if Rx == 0:
         return None, None, None, "origin→point: zero rotation at j"
     k = float(My / Rx)
-    # Build a tiny mask highlighting the chosen point
-    mask = np.zeros_like(rot, dtype=bool)
-    mask[j] = True
-    # R² doesn't really apply to 1-point secant; report n/a as 1.0
+    mask = np.zeros_like(rot, dtype=bool); mask[j] = True
     return k, 1.0, mask, f"origin→point j={j_index}"
-def window_by_moment_range(rot, mom, M_low, M_high,
-                           theta_min=1e-9, stop_at_first_peak=True):
+
+def window_by_moment_range(rot, mom, M_low, M_high, theta_min=1e-9, stop_at_first_peak=True):
     """
     Use points with M_low <= M <= M_high and rotation > theta_min.
-    If stop_at_first_peak=True, discard anything after the first local maximum
-    (captures the 'before the dip' part).
-    Returns (k, r2, mask) or (None, None, mask) if too few points.
+    If stop_at_first_peak=True, discard anything after the first local maximum (captures 'before the dip').
+    Returns (k, r2, mask).
     """
-    rot = np.asarray(rot, float)
-    mom = np.asarray(mom, float)
+    rot = np.asarray(rot, float); mom = np.asarray(mom, float)
 
-    # optional: stop at first local maximum (first index where mom starts decreasing)
+    # stop at first local maximum
     if stop_at_first_peak and mom.size >= 3:
         dec = np.where(mom[1:] < mom[:-1])[0]
         if dec.size:
-            i_peak = int(dec[0])      # last increasing index
+            i_peak = int(dec[0])     # last increasing index
             rot = rot[:i_peak+1]
             mom = mom[:i_peak+1]
 
@@ -131,20 +126,20 @@ def window_by_moment_range(rot, mom, M_low, M_high,
     xx, yy = rot[mask], mom[mask]
     if xx.size < 2:
         return None, None, mask
-
     k = ols_slope_through_origin(xx, yy)
     if k is None or not np.isfinite(k):
         return None, None, mask
     r2 = r2_linear(yy, k * xx)
     return k, r2, mask
 
-
-# --- AUTO: steepest initial prefix ---
-def choose_initial_prefix(rot, mom,
-                          k_cap=30,       # analyze up to the first 30 points (or all if fewer)
-                          r2_min=0.995,   # required linearity
-                          drop_tol=0.05,  # stop if slope drops >5% from running max
-                          theta_min=1e-9):
+# AUTO: steepest initial prefix
+def choose_initial_prefix(rot, mom, k_cap=30, r2_min=0.995, drop_tol=0.05, theta_min=1e-9):
+    """
+    Iterate k = 2..Kcap (prefix length). For each prefix (first k positive-rotation points):
+      - fit slope through origin; compute R²
+      - track running max slope (steepest prefix)
+    Return steepest straight prefix before a significant slope drop (> drop_tol).
+    """
     pos = rot > theta_min
     X = rot[pos]; Y = mom[pos]
     if X.size < 2:
@@ -190,50 +185,39 @@ def choose_initial_prefix(rot, mom,
                 "mask": running_mask, "reason": f"auto prefix: running max (k={running_k})"}
     return None
 
-# ---------- Sidebar ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     mrd = st.number_input("Mrd [kNm]", min_value=0.0, value=340.0, step=10.0)
     title = st.text_input("Plot title", "Rotational Stiffness")
 
     mode = st.radio(
         "Initial stiffness window",
-        ["Auto (recommended)", "Manual (% of Mrd)", "Manual (first K points)"],
+        ["Auto (recommended)", "Manual (% of Mrd)", "Manual (first K points)", "Manual (moment window)"],
         index=0
     )
 
     if mode == "Manual (% of Mrd)":
         q_mrd = st.slider("q% of Mrd (window cap)", 0.5, 50.0, 5.0, 0.5)
 
-    if mode == "Manual (first K points)":
+    elif mode == "Manual (first K points)":
         K_manual = st.slider("K (first points to use)", 2, 30, 2, 1)
         use_origin_point = st.checkbox("Use origin → point j instead", value=False)
         if use_origin_point:
             j_manual = st.slider("Choose point j (1 = first positive-rotation point)", 1, 30, 2, 1)
 
-mode = st.radio(
-    "Initial stiffness window",
-    ["Auto (recommended)", "Manual (% of Mrd)", "Manual (first K points)", "Manual (moment window)"],
-    index=0
-)
+    elif mode == "Manual (moment window)":
+        colA, colB = st.columns(2)
+        with colA:
+            M_low = st.number_input("M_low [kNm]", min_value=0.0, value=50.0, step=1.0)
+        with colB:
+            M_high = st.number_input("M_high [kNm]", min_value=0.0, value=200.0, step=1.0)
+        stop_at_peak = st.checkbox("Stop at first local peak (before the dip)", value=True)
 
-if mode == "Manual (% of Mrd)":
-    q_mrd = st.slider("q% of Mrd (window cap)", 0.5, 50.0, 5.0, 0.5)
-
-elif mode == "Manual (first K points)":
-    K_manual = st.slider("K (first points to use)", 2, 30, 2, 1)
-    use_origin_point = st.checkbox("Use origin → point j instead", value=False)
-    if use_origin_point:
-        j_manual = st.slider("Choose point j (1 = first positive-rotation point)", 1, 30, 2, 1)
-
-elif mode == "Manual (moment window)":
-    colA, colB = st.columns(2)
-    with colA:
-        M_low = st.number_input("M_low [kNm]", min_value=0.0, value=50.0, step=1.0)
-    with colB:
-        M_high = st.number_input("M_high [kNm]", min_value=0.0, value=200.0, step=1.0)
-    stop_at_peak = st.checkbox("Stop at first local peak (before the dip)", value=True)
-
-# ---------- File upload ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# File upload & tidy
+# ──────────────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
     "Choose an Excel file (.xlsx)",
     type=["xlsx"],
@@ -244,7 +228,6 @@ if not uploaded:
     st.info("Upload an Excel file to begin")
     st.stop()
 
-# ---------- Load & tidy (assume exactly 2 columns: Rotation, Moment) ----------
 df = pd.read_excel(uploaded)
 x = df.iloc[:, 0].to_numpy(float)
 y = df.iloc[:, 1].to_numpy(float)
@@ -252,10 +235,11 @@ mask = np.isfinite(x) & np.isfinite(y)
 x = x[mask]; y = y[mask]
 order = np.argsort(x)
 x = x[order]; y = y[order]
-
 theta_min = 1e-9
 
-# ---------- Compute Sj,ini ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Compute Sj,ini
+# ──────────────────────────────────────────────────────────────────────────────
 if mode == "Auto (recommended)":
     choice = choose_initial_prefix(x, y, k_cap=30, r2_min=0.995, drop_tol=0.05, theta_min=theta_min)
     if choice is None:
@@ -270,8 +254,8 @@ elif mode == "Manual (% of Mrd)":
         st.stop()
     Sj_ini = k; used_r2 = r2; used_mask = mask_q; note = f"manual, M ≤ {q_mrd:g}% of Mrd"
 
-else:  # Manual (first K points)
-    if use_origin_point:
+elif mode == "Manual (first K points)":
+    if 'use_origin_point' in locals() and use_origin_point:
         k, r2, mask_k, note = manual_origin_to_point(x, y, j_index=j_manual, theta_min=theta_min)
     else:
         k, r2, mask_k, note = manual_first_k(x, y, K=K_manual, theta_min=theta_min)
@@ -280,19 +264,18 @@ else:  # Manual (first K points)
         st.stop()
     Sj_ini = k; used_r2 = r2; used_mask = mask_k
 
-Sj = Sj_ini / 2.0
-
-elif mode == "Manual (moment window)":
+else:  # Manual (moment window)
     k, r2, mask_m = window_by_moment_range(x, y, M_low, M_high, theta_min=theta_min, stop_at_first_peak=stop_at_peak)
     if k is None:
         st.error("Too few points in the chosen moment window. Expand M_high or lower M_low.")
         st.stop()
-    Sj_ini = k
-    used_r2 = r2
-    used_mask = mask_m
-    note = f"manual, {M_low:g}–{M_high:g} kNm" + (" (stopped at first peak)" if stop_at_peak else "")
+    Sj_ini = k; used_r2 = r2; used_mask = mask_m; note = f"manual, {M_low:g}–{M_high:g} kNm" + (" (stopped at first peak)" if stop_at_peak else "")
 
-# ---------- Mrd & stiffness lines ----------
+Sj = Sj_ini / 2.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mrd & stiffness lines
+# ──────────────────────────────────────────────────────────────────────────────
 x_mrd = find_rotation_at_mrd(x, y, mrd)
 x_max = float(np.max(x)) if x.size else 0.0
 x_end_ini = (mrd / Sj_ini) if Sj_ini else x_max
@@ -304,11 +287,13 @@ x_line = np.array([0.0, x_limit], float)
 y_line_ini = Sj_ini * x_line
 y_line_sj  = Sj * x_line
 
-# ---------- Plot ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Plot
+# ──────────────────────────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(11, 6))
 ax.plot(x, y, label="Moment–Rotation", color="black", linewidth=1.8)
 
-if used_mask is not None and used_mask.any():
+if 'used_mask' in locals() and used_mask is not None and used_mask.any():
     ax.scatter(x[used_mask], y[used_mask], s=28, edgecolor="blue", facecolor="none",
                linewidth=1.2, label="Points used for Sj,ini")
 
@@ -330,11 +315,12 @@ ax.legend()
 fig.tight_layout()
 st.pyplot(fig, clear_figure=False)
 
-# ---------- Results ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Results
+# ──────────────────────────────────────────────────────────────────────────────
 st.subheader("Results")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Sj,ini [kNm/rad]", f"{Sj_ini:.1f}")
 c2.metric("Sj [kNm/rad]", f"{Sj:.1f}")
-c3.metric("R² (window)", f"{used_r2:.5f}" if used_r2 is not None else "n/a")
+c3.metric("R² (window)", f"{used_r2:.5f}" if 'used_r2' in locals() and used_r2 is not None else "n/a")
 c4.metric("Rotation at Mrd [rad]", f"{x_mrd:.6f}" if x_mrd is not None else "no intersection")
-
