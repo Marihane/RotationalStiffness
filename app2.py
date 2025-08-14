@@ -17,7 +17,7 @@ with st.expander("What the app does (short)", expanded=False):
 
 - **Auto (recommended):** looks at the first few points (smallest rotations), fits lines through the origin,
   and picks the **steepest straight prefix** before the curve begins to bend.
-- **Manual (sliding window):** choose a **window size K** (number of consecutive points) and **move it**
+- **Manual (sliding window):** choose a **window size K** (number of points) and **move it**
   along the curve (including the **very first point at rotation = 0**). The slope is an OLS line **through the origin**
   using only those K points. The app quietly adjusts if your chosen window would be invalid.
         """
@@ -192,9 +192,9 @@ if mode == "Manual (sliding window)":
         st.stop()
     max_K = int(min(30, n_total))
     with st.sidebar:
-        K_manual = st.slider("K (consecutive points)", 2, max_K, 2, 1)
+        K_manual = st.slider("Number of points)", 2, max_K, 2, 1)
         max_start = max(1, n_total - K_manual + 1)
-        start_j = st.slider("Start at point j (1 = very first point)", 1, max_start, 1, 1)
+        start_j = st.slider("Starting point)", 1, max_start, 1, 1)
 else:
     K_manual = None
     start_j = None
@@ -262,3 +262,4 @@ c1.metric("Sj,ini [kNm/rad]", f"{Sj_ini:.1f}")
 c2.metric("Sj [kNm/rad]", f"{Sj:.1f}")
 c3.metric("R² (window)", f"{used_r2:.5f}" if used_r2 is not None else "n/a")
 c4.metric("Rotation at Mrd [rad]", f"{x_mrd:.6f}" if x_mrd is not None else "no intersection")
+
